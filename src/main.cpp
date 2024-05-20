@@ -150,7 +150,7 @@ void setup() {
     USB.PID(0xc631);
     USB.VID(0x256f);
     USB.begin();
-    TinyUSBDevice.setManufacturerDescriptor("3DCONNEXOR");
+    TinyUSBDevice.setManufacturerDescriptor("3DCONNEXION");
     TinyUSBDevice.setProductDescriptor("SpaceMouse Pro Wireless");
     TinyUSBDevice.setID(0x256f, 0xc631);
     usb_hid.setPollInterval(2);
