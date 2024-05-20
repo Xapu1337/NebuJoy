@@ -1,5 +1,8 @@
 # My 3D SpaceMouse project
 
+## I'M A BEGINNER / NEW, SO INSTRUCTIONS OR CODE MIGHT CHANGE
+## I want others to tinker with their own solution and the original called for an arduino nano, and I like faster microcontrollers.
+
 Based on (DIY 3D SpaceMouse by TeachingTech)[https://www.printables.com/model/864950-open-source-spacemouse-space-mushroom-remix] from YouTube 
 
 Code has been changed to run on any ESP device capable of USB-OTG (S2, S3)
