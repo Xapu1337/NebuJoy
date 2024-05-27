@@ -1,118 +1,69 @@
-#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
 #include <Adafruit_TinyUSB.h>
+#include <array>
 
 #define JOYSTICK_COUNT 4
-#define DOF 6
-#define FILTER_SIZE 10  // Size of the moving average filter
-#define DEAD_THRES 1
-#define SPEED_PARAM 600
+#define INITIAL_DEADZONE 10
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Mouse Debug</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        let scene, camera, renderer, cube;
 
-// Debug levels
-enum DebugLevel {
-    DEBUG_OFF,
-    DEBUG_RAW,
-    DEBUG_CENTERED,
-    DEBUG_DEADZONE,
-    DEBUG_MOTION,
-    DEBUG_COMBINED
-};
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('canvas') });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
 
-int debug = DEBUG_COMBINED;
+            const geometry = new THREE.BoxGeometry();
+            const material = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+            cube = new THREE.Mesh(geometry, material);
+            scene.add(cube);
 
-bool invX = false;
-bool invY = false;
-bool invZ = false;
-bool invRX = false;
-bool invRY = true;
-bool invRZ = true;
-
-int16_t speed = 40; // Reduced speed for less bouncy movement
-int DEADZONE = 10;
-
-class Joystick {
-public:
-    Joystick(int xPin, int yPin) : xPin(xPin), yPin(yPin), filterIndex(0) {
-        pinMode(xPin, INPUT);
-        pinMode(yPin, INPUT);
-        for (int i = 0; i < FILTER_SIZE; i++) {
-            xValues[i] = 0;
-            yValues[i] = 0;
+            camera.position.z = 5;
         }
-    }
 
-    void readData() {
-        int x = analogRead(xPin);
-        int y = analogRead(yPin);
+        function animate() {
+            requestAnimationFrame(animate);
 
-        // Update the filter buffers
-        xValues[filterIndex] = x;
-        yValues[filterIndex] = y;
+            fetch('/motion')
+                .then(response => response.json())
+                .then(data => {
+                    cube.rotation.x = data.rotX / 32767 * Math.PI;
+                    cube.rotation.y = data.rotY / 32767 * Math.PI;
+                    cube.rotation.z = data.rotZ / 32767 * Math.PI;
+                });
 
-        // Move to the next position in the buffer
-        filterIndex = (filterIndex + 1) % FILTER_SIZE;
-
-        // Calculate the average
-        xValue = average(xValues, FILTER_SIZE);
-        yValue = average(yValues, FILTER_SIZE);
-    }
-
-    void setCenter() {
-        centerPosX = xValue;
-        centerPosY = yValue;
-    }
-
-    int getX() const {
-        return xValue - centerPosX;
-    }
-
-    int getY() const {
-        return yValue - centerPosY;
-    }
-
-private:
-    int xPin;
-    int yPin;
-    int xValue;
-    int yValue;
-    int centerPosX;
-    int centerPosY;
-    int filterIndex;
-    int xValues[FILTER_SIZE];
-    int yValues[FILTER_SIZE];
-
-    int average(int* values, int size) const {
-        long sum = 0;
-        for (int i = 0; i < size; i++) {
-            sum += values[i];
+            renderer.render(scene, camera);
         }
-        return sum / size;
-    }
-};
 
-class Motion {
-public:
-    Motion(int transX, int transY, int transZ, int rotX, int rotY, int rotZ) 
-        : transX(transX), transY(transY), transZ(transZ), rotX(rotX), rotY(rotY), rotZ(rotZ) {}
-
-    int transX;
-    int transY;
-    int transZ;
-    int rotX;
-    int rotY;
-    int rotZ;
-};
-
-Joystick joysticks[JOYSTICK_COUNT] = {
-    Joystick(16, 18),
-    Joystick(3, 5),
-    Joystick(11, 12),
-    Joystick(7, 9)
-};
-
-Adafruit_USBD_HID usb_hid;
+        window.onload = () => {
+            init();
+            animate();
+        };
+    </script>
+</body>
+</html>
+)rawliteral";
 
 static const uint8_t _hidReportDescriptor[] PROGMEM = {
-    0x05, 0x01,           //  Usage Page (Generic Desktop)
+     0x05, 0x01,           //  Usage Page (Generic Desktop)
     0x09, 0x08,           //  0x08: Usage (Multi-Axis)
     0xa1, 0x01,           //  Collection (Application)
     0xa1, 0x00,           // Collection (Physical)
@@ -144,9 +95,216 @@ static const uint8_t _hidReportDescriptor[] PROGMEM = {
     0xC0
 };
 
-void setup() {
-    Serial.begin(115200);
+enum Mode {
+    MODE_USB,
+    MODE_WIFI
+};
 
+enum AxisInversion {
+    NO_INVERT,
+    INVERT
+};
+
+class Joystick {
+public:
+    Joystick(int xPin, int yPin, AxisInversion invX = NO_INVERT, AxisInversion invY = NO_INVERT)
+        : xPin(xPin), yPin(yPin), filterIndex(0), invX(invX), invY(invY), xValue(0), yValue(0),
+          centerPosX(0), centerPosY(0) {
+        pinMode(xPin, INPUT);
+        pinMode(yPin, INPUT);
+        xValues.fill(0);
+        yValues.fill(0);
+    }
+
+    void readData() {
+        int x = analogRead(xPin);
+        int y = analogRead(yPin);
+
+        xValues[filterIndex] = x;
+        yValues[filterIndex] = y;
+
+        filterIndex = (filterIndex + 1) % FILTER_SIZE;
+
+        xValue = average(xValues);
+        yValue = average(yValues);
+
+        if (invX == INVERT) xValue = -xValue;
+        if (invY == INVERT) yValue = -yValue;
+    }
+
+    void setCenter() {
+        int totalX = 0;
+        int totalY = 0;
+
+        for (int i = 0; i < CALIBRATION_READS; i++) {
+            readData();
+            totalX += xValue;
+            totalY += yValue;
+            delay(10);  // Delay between reads
+        }
+
+        centerPosX = totalX / CALIBRATION_READS;
+        centerPosY = totalY / CALIBRATION_READS;
+    }
+
+    int getX() const {
+        return xValue - centerPosX;
+    }
+
+    int getY() const {
+        return yValue - centerPosY;
+    }
+
+private:
+    int xPin;
+    int yPin;
+    int xValue;
+    int yValue;
+    int centerPosX;
+    int centerPosY;
+    int filterIndex;
+    static const int FILTER_SIZE = 10;
+    static const int CALIBRATION_READS = 50;
+    std::array<int, FILTER_SIZE> xValues;
+    std::array<int, FILTER_SIZE> yValues;
+    AxisInversion invX;
+    AxisInversion invY;
+
+    int average(const std::array<int, FILTER_SIZE>& values) const {
+        long sum = 0;
+        for (int value : values) {
+            sum += value;
+        }
+        return sum / FILTER_SIZE;
+    }
+};
+
+class Motion {
+public:
+    Motion(int16_t transX = 0, int16_t transY = 0, int16_t transZ = 0, int16_t rotX = 0, int16_t rotY = 0, int16_t rotZ = 0) 
+        : transX(transX), transY(transY), transZ(transZ), rotX(rotX), rotY(rotY), rotZ(rotZ) {}
+
+    void applySpeed(int16_t speed) {
+        transX = transX * speed / 100;
+        transY = transY * speed / 100;
+        transZ = transZ * speed / 100;
+        rotX = rotX * speed / 100;
+        rotY = rotY * speed / 100;
+        rotZ = rotZ * speed / 100;
+    }
+
+    void log() const {
+        Serial.print("Motion - Trans: X=");
+        Serial.print(transX);
+        Serial.print(" Y=");
+        Serial.print(transY);
+        Serial.print(" Z=");
+        Serial.print(transZ);
+        Serial.print(" | Rot: X=");
+        Serial.print(rotX);
+        Serial.print(" Y=");
+        Serial.print(rotY);
+        Serial.print(" Z=");
+        Serial.println(rotZ);
+    }
+
+    int16_t transX;
+    int16_t transY;
+    int16_t transZ;
+    int16_t rotX;
+    int16_t rotY;
+    int16_t rotZ;
+};
+
+class JoystickArray {
+public:
+    JoystickArray(std::array<Joystick, JOYSTICK_COUNT>& joysticks) : joysticks(joysticks), deadzone(INITIAL_DEADZONE), lastActivityTime(0) {}
+
+    void calibrateDeadzone() {
+        int16_t maxDeviation = 0;
+        for (auto& joystick : joysticks) {
+            joystick.readData();
+            int deviationX = abs(joystick.getX());
+            int deviationY = abs(joystick.getY());
+            if (deviationX > maxDeviation) maxDeviation = deviationX;
+            if (deviationY > maxDeviation) maxDeviation = deviationY;
+        }
+        deadzone = maxDeviation + 10; // Adding a buffer to ensure deadzone
+        Serial.print("Calibrated deadzone: ");
+        Serial.println(deadzone);
+    }
+
+    Motion calculateMotion() {
+        std::array<int16_t, JOYSTICK_COUNT * 2> currentReads;
+        bool isCentered = true;
+
+        for (int i = 0; i < JOYSTICK_COUNT; i++) {
+            joysticks[i].readData();
+            currentReads[2 * i] = joysticks[i].getX();
+            currentReads[2 * i + 1] = joysticks[i].getY();
+
+            if (abs(currentReads[2 * i]) > deadzone || abs(currentReads[2 * i + 1]) > deadzone) {
+                isCentered = false;
+            }
+        }
+
+        if (isCentered) {
+            return Motion();
+        }
+
+        Motion motion;
+        motion.transX = calculateTranslation(currentReads, 0, 2);
+        motion.transY = calculateTranslation(currentReads, 3, 6);
+        motion.transZ = calculateTranslation(currentReads, 0, 2, 4, 6);
+        motion.rotX = calculateRotation(currentReads, 1, 5);
+        motion.rotY = calculateRotation(currentReads, 0, 4);
+        motion.rotZ = calculateRotation(currentReads, 1, 3, 5, 7);
+
+        return motion;
+    }
+
+    void updateLastActivityTime() {
+        lastActivityTime = millis();
+    }
+
+private:
+    std::array<Joystick, JOYSTICK_COUNT>& joysticks;
+    int deadzone;
+    unsigned long lastActivityTime;
+
+    int16_t calculateTranslation(const std::array<int16_t, JOYSTICK_COUNT * 2>& reads, int index1, int index2) {
+        return (-reads[index1] + reads[index2]) / 2;
+    }
+
+    int16_t calculateTranslation(const std::array<int16_t, JOYSTICK_COUNT * 2>& reads, int index1, int index2, int index3, int index4) {
+        return (-reads[index1] - reads[index2] - reads[index3] - reads[index4]) / 2;
+    }
+
+    int16_t calculateRotation(const std::array<int16_t, JOYSTICK_COUNT * 2>& reads, int index1, int index2) {
+        return (-reads[index1] + reads[index2]) / 2;
+    }
+
+    int16_t calculateRotation(const std::array<int16_t, JOYSTICK_COUNT * 2>& reads, int index1, int index2, int index3, int index4) {
+        return (reads[index1] + reads[index2] + reads[index3] + reads[index4]) / 4;
+    }
+};
+
+Mode currentMode = MODE_WIFI;
+WebServer server(80);
+Adafruit_USBD_HID usb_hid;
+
+std::array<Joystick, JOYSTICK_COUNT> joysticks = {
+    Joystick(16, 18),
+    Joystick(3, 5),
+    Joystick(11, 12),
+    Joystick(7, 9)
+};
+
+JoystickArray joystickArray(joysticks);
+int16_t speed = 40;
+Motion lastMotion;
+
+void setupUSBHID() {
     USB.PID(0xc631);
     USB.VID(0x256f);
     USB.begin();
@@ -156,95 +314,87 @@ void setup() {
     usb_hid.setPollInterval(2);
     usb_hid.setReportDescriptor(_hidReportDescriptor, sizeof(_hidReportDescriptor));
     usb_hid.begin();
-
     while (!TinyUSBDevice.mounted()) delay(1);
-
-    for (int i = 0; i < JOYSTICK_COUNT; i++) {
-        joysticks[i].readData();
-        joysticks[i].setCenter();
-    }
 }
 
-void send_command(int16_t rx, int16_t ry, int16_t rz, int16_t x, int16_t y, int16_t z) {
-    uint8_t trans[6] = {x & 0xFF, x >> 8, y & 0xFF, y >> 8, z & 0xFF, z >> 8};
+void logIPAddress() {
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+}
+void setupWiFi() {
+    WiFi.begin("insert", "insert");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(1000);
+        Serial.println("Connecting to WiFi...");
+    }
+    Serial.println("Connected to WiFi");
+    logIPAddress();
+
+    server.on("/", HTTP_GET, []() {
+        server.send_P(200, "text/html", index_html);
+    });
+
+    server.on("/motion", HTTP_GET, []() {
+        DynamicJsonDocument doc(1024);
+        doc["transX"] = lastMotion.transX;
+        doc["transY"] = lastMotion.transY;
+        doc["transZ"] = lastMotion.transZ;
+        doc["rotX"] = lastMotion.rotX;
+        doc["rotY"] = lastMotion.rotY;
+        doc["rotZ"] = lastMotion.rotZ;
+        String output;
+        serializeJson(doc, output);
+        server.send(200, "application/json", output);
+    });
+
+    server.begin();
+}
+
+
+void setup() {
+    Serial.begin(115200);
+    if (currentMode == MODE_USB) {
+        setupUSBHID();
+    } else {
+        setupWiFi();
+    }
+
+    for (auto& joystick : joysticks) {
+        joystick.readData();
+        delay(100);  // Ensure stable readings
+        joystick.setCenter();
+    }
+    joystickArray.calibrateDeadzone(); // Calibrate deadzone after centering
+}
+
+void sendCommand(const Motion& motion) {
+    uint8_t trans[6] = {motion.transX & 0xFF, motion.transX >> 8, motion.transY & 0xFF, motion.transY >> 8, motion.transZ & 0xFF, motion.transZ >> 8};
     usb_hid.sendReport(1, trans, 6);
-    uint8_t rot[6] = {rx & 0xFF, rx >> 8, ry & 0xFF, ry >> 8, rz & 0xFF, rz >> 8};
+    uint8_t rot[6] = {motion.rotX & 0xFF, motion.rotX >> 8, motion.rotY & 0xFF, motion.rotY >> 8, motion.rotZ & 0xFF, motion.rotZ >> 8};
     usb_hid.sendReport(2, rot, 6);
 }
 
-Motion calculateMotion() {
-    int16_t centered[JOYSTICK_COUNT * 2];
-    int16_t currentReads[JOYSTICK_COUNT * 2];
-
-    bool isCentered = true; // Flag to check if all joysticks are at the center
-
-    for (int i = 0; i < JOYSTICK_COUNT; i++) {
-        joysticks[i].readData();
-        currentReads[2 * i] = joysticks[i].getX();
-        currentReads[2 * i + 1] = joysticks[i].getY();
-
-// Check if any joystick is not at the center
-        if (currentReads[2 * i] != 0 || currentReads[2 * i + 1] != 0) {
-            isCentered = false;
-        }
-    }
-
-    if (isCentered) {
-        // If all joysticks are at the center, return zero motion
-        return Motion(0, 0, 0, 0, 0, 0);
-    }
-
-    for (int i = 0; i < JOYSTICK_COUNT * 2; i++) {
-        centered[i] = currentReads[i];
-        if (centered[i] < DEADZONE && centered[i] > -DEADZONE) centered[i] = 0;
-    }
-
-    Motion motion(
-        (-centered[0] + centered[2]) / 2, // transX
-        (centered[3] - centered[6]) / 2, // transY (adjusted)
-        (-centered[0] - centered[2] - centered[4] - centered[6]) / 2, // transZ
-        (-centered[1] + centered[5]) / 2, // rotX
-        (-centered[0] + centered[4]) / 2, // rotY
-        (centered[1] + centered[3] + centered[5] + centered[7]) / 4 // rotZ
-    );
-
-    motion.transX = motion.transX * speed / 100;
-    motion.transY = motion.transY * speed / 100;
-    motion.transZ = motion.transZ * speed / 100;
-    motion.rotX = motion.rotX * speed / 100;
-    motion.rotY = motion.rotY * speed / 100;
-    motion.rotZ = motion.rotZ * speed / 100;
-
-    if (invX) motion.transX *= -1;
-    if (invY) motion.transY *= -1;
-    if (invZ) motion.transZ *= -1;
-    if (invRX) motion.rotX *= -1;
-    if (invRY) motion.rotY *= -1;
-    if (invRZ) motion.rotZ *= -1;
-
-    if (debug >= DEBUG_MOTION) {
-        Serial.print("Trans: X=");
-        Serial.print(motion.transX);
-        Serial.print(" Y=");
-        Serial.print(motion.transY);
-        Serial.print(" Z=");
-        Serial.println(motion.transZ);
-        Serial.print("Rot: X=");
-        Serial.print(motion.rotX);
-        Serial.print(" Y=");
-        Serial.print(motion.rotY);
-        Serial.print(" Z=");
-        Serial.println(motion.rotZ);
-    }
-
-    return motion;
+bool motionChanged(const Motion& newMotion, const Motion& lastMotion) {
+    return newMotion.transX != lastMotion.transX || newMotion.transY != lastMotion.transY || newMotion.transZ != lastMotion.transZ ||
+           newMotion.rotX != lastMotion.rotX || newMotion.rotY != lastMotion.rotY || newMotion.rotZ != lastMotion.rotZ;
 }
 
 void loop() {
-    if (!usb_hid.ready()) return;
+    if (currentMode == MODE_USB) {
+        if (!usb_hid.ready()) return;
+    } else {
+        server.handleClient();
+    }
 
-    Motion motion = calculateMotion();
-    send_command(motion.rotX, motion.rotY, motion.rotZ, motion.transX, motion.transY, motion.transZ);
+    Motion motion = joystickArray.calculateMotion();
+    motion.applySpeed(speed);
+
+    if (motionChanged(motion, lastMotion)) {
+        if (currentMode == MODE_USB) {
+            sendCommand(motion);
+        }
+        lastMotion = motion;
+    }
 
     delay(20);
 }
